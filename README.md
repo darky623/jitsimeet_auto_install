@@ -25,8 +25,8 @@
 ⚙️ Установка
 	1.	Склонируйте репозиторий:
 
-git clone https://github.com/yourusername/jitsi-autoinstall.git
-cd jitsi-autoinstall
+git clone https://github.com/darky623/jitsimeet_auto_install.git
+cd jitsimeet_auto_install
 
 	2.	Отредактируйте скрипт, указав свой домен и email:
 
