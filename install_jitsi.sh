@@ -90,6 +90,17 @@ services:
       meet.jitsi:
         aliases:
           - prosody
+          - xmpp.meet.jitsi
+          - meet.jitsi
+          - auth.meet.jitsi
+          - muc.meet.jitsi
+          - internal-muc.meet.jitsi
+          - lobby.meet.jitsi
+          - speakerstats.meet.jitsi
+          - avmoderation.meet.jitsi
+          - metadata.meet.jitsi
+          - endconference.meet.jitsi
+          - breakout.meet.jitsi
     volumes:
       - ./config/prosody:/config:Z
     environment:
