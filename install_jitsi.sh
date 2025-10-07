@@ -1,103 +1,185 @@
 #!/usr/bin/env bash
-# Jitsi Meet автоустановка на Ubuntu 22.04+
-# Обновление пакетов, выпуск Let's Encrypt, настройка домена и установка Jitsi
-# Запуск: sudo bash install_jitsi.sh
-
+# Авторазвёртывание Jitsi Meet в Docker на Ubuntu 22.04+
 set -euo pipefail
 
-### ====== НАСТРОЙКИ ======
-DOMAIN="meet.example.com"          # ← укажите ваш домен
+### === НАСТРОЙКИ ===
+DOMAIN="meet.example.com"          # ← твой домен
 EMAIL="admin@example.com"          # ← email для Let's Encrypt
-ENABLE_UFW="yes"                   # yes/no — настраивать ли UFW (firewall)
+TZ="UTC"                           # ← часовой пояс, напр. "Asia/Ho_Chi_Minh"
+STACK_DIR="/opt/jitsi"
+COMPOSE_FILE="${STACK_DIR}/docker-compose.yml"
 
-### ====== ПРОВЕРКИ ======
+### === ПРОВЕРКИ ===
 if [[ $EUID -ne 0 ]]; then
-  echo "Запустите скрипт от root: sudo bash $0"
+  echo "Запусти от root: sudo bash $0"
   exit 1
 fi
 
-echo "[1/8] Проверяю, что домен указывает на этот сервер…"
+command -v curl >/dev/null || apt-get update -y
+apt-get install -y curl
+
+echo "[1/8] Проверяю DNS домена → должен указывать на этот сервер…"
 PUB_IP="$(curl -fsSL https://api.ipify.org || true)"
-if [[ -z "${PUB_IP}" ]]; then
-  echo "Предупреждение: не удалось определить публичный IP. Пропускаю проверку DNS."
+DNS_IP="$(getent ahosts "$DOMAIN" | awk 'NR==1{print $1}' || true)"
+echo "Публичный IP: ${PUB_IP:-unknown}; DNS(${DOMAIN}): ${DNS_IP:-unknown}"
+if [[ -n "${PUB_IP}" && -n "${DNS_IP}" && "${PUB_IP}" != "${DNS_IP}" ]]; then
+  echo "⚠️  ВНИМАНИЕ: ${DOMAIN} сейчас не указывает на ${PUB_IP}. Let's Encrypt может не сработать."
+fi
+
+echo "[2/8] Устанавливаю Docker Engine + compose-plugin…"
+if ! command -v docker >/dev/null 2>&1; then
+  apt-get update -y
+  apt-get install -y ca-certificates gnupg lsb-release
+  install -m 0755 -d /etc/apt/keyrings
+  curl -fsSL https://download.docker.com/linux/ubuntu/gpg | gpg --dearmor -o /etc/apt/keyrings/docker.gpg
+  echo \
+  "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/ubuntu \
+  $(lsb_release -cs) stable" > /etc/apt/sources.list.d/docker.list
+  apt-get update -y
+  apt-get install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
+  systemctl enable --now docker
 else
-  DNS_IP="$(getent ahosts "$DOMAIN" | awk 'NR==1{print $1}' || true)"
-  if [[ -z "${DNS_IP}" ]]; then
-    echo "Предупреждение: не удалось получить A/AAAA запись для $DOMAIN. Убедитесь, что DNS настроен."
-  else
-    echo "Публичный IP сервера: ${PUB_IP}; DNS для ${DOMAIN}: ${DNS_IP}"
-    if [[ "${DNS_IP}" != "${PUB_IP}" ]]; then
-      echo "ВНИМАНИЕ: ${DOMAIN} сейчас не указывает на ${PUB_IP}. Let's Encrypt может не выдать сертификат."
-      echo "Продолжаю, но выпуск сертификата может провалиться."
-    fi
-  fi
+  echo "Docker уже установлен."
 fi
 
-echo "[2/8] Обновляю систему и базовые утилиты…"
-apt-get update -y
-DEBIAN_FRONTEND=noninteractive apt-get dist-upgrade -y
-apt-get install -y curl gnupg2 apt-transport-https ca-certificates software-properties-common debconf-utils lsb-release
+echo "[3/8] Готовлю каталог стека: ${STACK_DIR}"
+mkdir -p "${STACK_DIR}/config" "${STACK_DIR}/transcripts" "${STACK_DIR}/recordings"
+cd "${STACK_DIR}"
 
-echo "[3/8] Устанавливаю hostname = ${DOMAIN}…"
-hostnamectl set-hostname "${DOMAIN}"
+echo "[4/8] Генерирую .env с безопасными паролями…"
+# функции генерации
+rand() { openssl rand -hex 16; }
+cat > .env <<EOF
+# === БАЗА ===
+HTTP_PORT=80
+HTTPS_PORT=443
+TZ=${TZ}
+PUBLIC_URL=https://${DOMAIN}
+# включаем LE
+ENABLE_LETSENCRYPT=1
+LETSENCRYPT_DOMAIN=${DOMAIN}
+LETSENCRYPT_EMAIL=${EMAIL}
 
-echo "[4/8] Добавляю репозиторий Jitsi…"
-install -d -m 0755 /usr/share/keyrings
-curl -fsSL https://download.jitsi.org/jitsi-key.gpg.key | gpg --dearmor > /usr/share/keyrings/jitsi-keyring.gpg
-echo "deb [signed-by=/usr/share/keyrings/jitsi-keyring.gpg] https://download.jitsi.org stable/" > /etc/apt/sources.list.d/jitsi-stable.list
-apt-get update -y
+# === ПАРОЛИ (автогенерация) ===
+# Prosody (XMPP)
+XMPP_DOMAIN=meet.jitsi
+XMPP_SERVER=prosody
+XMPP_AUTH_DOMAIN=auth.meet.jitsi
+XMPP_MUC_DOMAIN=muc.meet.jitsi
+XMPP_INTERNAL_MUC_DOMAIN=internal-muc.meet.jitsi
+XMPP_GUEST_DOMAIN=guest.meet.jitsi
+JICOFO_COMPONENT_SECRET=$(rand)
+JICOFO_AUTH_PASSWORD=$(rand)
+JVB_AUTH_PASSWORD=$(rand)
 
-echo "[5/8] Преднастраиваю debconf для бесшумной установки…"
-# Указываем домен пакету jitsi-meet
-echo "jitsi-meet jitsi-meet/hostname string ${DOMAIN}" | debconf-set-selections
-# На этапе установки выберем временный самоподписанный сертификат,
-# потом заменим его Let's Encrypt скриптом от Jitsi
-echo "jitsi-meet jitsi-meet/cert-choice select Generate a new self-signed certificate (You will later get a chance to obtain a Let's encrypt certificate)" | debconf-set-selections
+# Включаем гостевой доступ (опционально)
+ENABLE_GUESTS=1
 
-echo "[6/8] Устанавливаю Jitsi Meet (это поставит nginx, prosody, jicofo, jvb)…"
-if ! apt-cache policy prosody | grep -q "0.12"; then
-  echo "Добавляю репозиторий Prosody (>=0.12)…"
-  echo "deb https://packages.prosody.im/debian $(lsb_release -sc) main" | tee /etc/apt/sources.list.d/prosody.list
-  wget https://prosody.im/files/prosody-debian-packages.key -O- | apt-key add -
-  apt-get update
+# TURN не настраиваем (по умолчанию WebRTC через UDP:10000)
+# При необходимости доконфигурируй coturn отдельно.
+EOF
+
+echo "[5/8] Создаю docker-compose.yml…"
+cat > "${COMPOSE_FILE}" <<'YML'
+services:
+  # XMPP сервер (Prosody)
+  prosody:
+    image: docker.io/jitsi/prosody:stable
+    restart: unless-stopped
+    networks:
+      meet.jitsi:
+        aliases:
+          - prosody
+    volumes:
+      - ./config/prosody:/config:Z
+    environment:
+      - XMPP_DOMAIN=${XMPP_DOMAIN}
+      - XMPP_AUTH_DOMAIN=${XMPP_AUTH_DOMAIN}
+      - XMPP_MUC_DOMAIN=${XMPP_MUC_DOMAIN}
+      - XMPP_INTERNAL_MUC_DOMAIN=${XMPP_INTERNAL_MUC_DOMAIN}
+      - XMPP_GUEST_DOMAIN=${XMPP_GUEST_DOMAIN}
+      - PUBLIC_URL=${PUBLIC_URL}
+      - JICOFO_COMPONENT_SECRET=${JICOFO_COMPONENT_SECRET}
+      - JICOFO_AUTH_PASSWORD=${JICOFO_AUTH_PASSWORD}
+      - JVB_AUTH_PASSWORD=${JVB_AUTH_PASSWORD}
+      - ENABLE_GUESTS=${ENABLE_GUESTS}
+      - TZ=${TZ}
+
+  # Веб-интерфейс (nginx) + Let's Encrypt
+  web:
+    image: docker.io/jitsi/web:stable
+    restart: unless-stopped
+    depends_on:
+      - prosody
+    networks:
+      - meet.jitsi
+    ports:
+      - "${HTTP_PORT:-80}:80"
+      - "${HTTPS_PORT:-443}:443"
+    volumes:
+      - ./config/web:/config:Z
+      - ./transcripts:/usr/share/jitsi-meet/transcripts:Z
+      - ./recordings:/recordings:Z
+    environment:
+      - PUBLIC_URL=${PUBLIC_URL}
+      - ENABLE_LETSENCRYPT=${ENABLE_LETSENCRYPT}
+      - LETSENCRYPT_DOMAIN=${LETSENCRYPT_DOMAIN}
+      - LETSENCRYPT_EMAIL=${LETSENCRYPT_EMAIL}
+      - TZ=${TZ}
+
+  # Jicofo (фокус конференций)
+  jicofo:
+    image: docker.io/jitsi/jicofo:stable
+    restart: unless-stopped
+    depends_on:
+      - prosody
+    networks:
+      - meet.jitsi
+    volumes:
+      - ./config/jicofo:/config:Z
+    environment:
+      - XMPP_DOMAIN=${XMPP_DOMAIN}
+      - XMPP_AUTH_DOMAIN=${XMPP_AUTH_DOMAIN}
+      - XMPP_SERVER=prosody
+      - JICOFO_COMPONENT_SECRET=${JICOFO_COMPONENT_SECRET}
+      - JICOFO_AUTH_PASSWORD=${JICOFO_AUTH_PASSWORD}
+      - TZ=${TZ}
+
+  # Видео-бридж (медиа через UDP:10000)
+  jvb:
+    image: docker.io/jitsi/jvb:stable
+    restart: unless-stopped
+    networks:
+      - meet.jitsi
+    ports:
+      - "10000:10000/udp"
+    volumes:
+      - ./config/jvb:/config:Z
+    environment:
+      - XMPP_SERVER=prosody
+      - XMPP_DOMAIN=${XMPP_DOMAIN}
+      - XMPP_AUTH_DOMAIN=${XMPP_AUTH_DOMAIN}
+      - XMPP_INTERNAL_MUC_DOMAIN=${XMPP_INTERNAL_MUC_DOMAIN}
+      - JVB_AUTH_PASSWORD=${JVB_AUTH_PASSWORD}
+      - TZ=${TZ}
+
+networks:
+  meet.jitsi:
+    driver: bridge
+YML
+
+echo "[6/8] Открываю firewall (если UFW установлен)…"
+if command -v ufw >/dev/null 2>&1; then
+  ufw allow 80/tcp   || true
+  ufw allow 443/tcp  || true
+  ufw allow 10000/udp || true
 fi
-DEBIAN_FRONTEND=noninteractive apt-get install -y jitsi-meet
 
-echo "[7/8] Выпускаю и подключаю сертификат Let's Encrypt для ${DOMAIN}…"
-# Скрипт Jitsi задаст один вопрос — email; передадим его через stdin
-if command -v certbot >/dev/null 2>&1; then
-  echo "certbot уже установлен."
-fi
-# Скрипт сам настроит nginx-конфиг на /etc/letsencrypt/live/${DOMAIN}/
-if [[ -x /usr/share/jitsi-meet/scripts/install-letsencrypt-cert.sh ]]; then
-  printf "%s\n" "${EMAIL}" | /usr/share/jitsi-meet/scripts/install-letsencrypt-cert.sh
-else
-  echo "Не найден install-letsencrypt-cert.sh — проверите установку jitsi-meet."
-  exit 1
-fi
+echo "[7/8] Запускаю стек…"
+docker compose -f "${COMPOSE_FILE}" --env-file .env up -d
 
-echo "[8/8] Открываю нужные порты в UFW (если включено)…"
-if [[ "${ENABLE_UFW}" == "yes" ]]; then
-  if ! command -v ufw >/dev/null 2>&1; then
-    apt-get install -y ufw
-  fi
-  ufw allow OpenSSH >/dev/null 2>&1 || true
-  ufw allow 80/tcp   >/dev/null 2>&1 || true
-  ufw allow 443/tcp  >/dev/null 2>&1 || true
-  ufw allow 10000/udp >/dev/null 2>&1 || true
-  # Рекомендуемые порты для TURN (опционально, если нужен внешний TURN)
-  ufw allow 3478/udp  >/dev/null 2>&1 || true
-  ufw allow 5349/tcp  >/dev/null 2>&1 || true
-  # Включать UFW автоматически опасно, включите вручную если надо:
-  echo "UFW правила добавлены. Включить firewall: 'ufw enable' (проверьте доступ по SSH!)."
-fi
-
-echo "Перезапускаю службы…"
-systemctl restart nginx || true
-systemctl restart prosody || true
-systemctl restart jicofo || true
-systemctl restart jitsi-videobridge2 || true
-
-echo "Готово! Проверьте: https://${DOMAIN}"
-echo "Если сертификат не выпустился — перепроверьте DNS A/AAAA запись домена и повторите шаг с Let's Encrypt:"
-echo "  printf \"%s\\n\" \"${EMAIL}\" | /usr/share/jitsi-meet/scripts/install-letsencrypt-cert.sh"
+echo "[8/8] Проверяю контейнеры…"
+docker compose -f "${COMPOSE_FILE}" ps
+echo
+echo "✅ Готово! Открой https://${DOMAIN}"
+echo "Если LE-сертификат не подтянулся — проверь, что DNS домена указывает на этот сервер и порт 80/443 открыт."
