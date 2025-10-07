@@ -55,6 +55,12 @@ echo "jitsi-meet jitsi-meet/hostname string ${DOMAIN}" | debconf-set-selections
 echo "jitsi-meet jitsi-meet/cert-choice select Generate a new self-signed certificate (You will later get a chance to obtain a Let's encrypt certificate)" | debconf-set-selections
 
 echo "[6/8] Устанавливаю Jitsi Meet (это поставит nginx, prosody, jicofo, jvb)…"
+if ! apt-cache policy prosody | grep -q "0.12"; then
+  echo "Добавляю репозиторий Prosody (>=0.12)…"
+  echo "deb https://packages.prosody.im/debian $(lsb_release -sc) main" | tee /etc/apt/sources.list.d/prosody.list
+  wget https://prosody.im/files/prosody-debian-packages.key -O- | apt-key add -
+  apt-get update
+fi
 DEBIAN_FRONTEND=noninteractive apt-get install -y jitsi-meet
 
 echo "[7/8] Выпускаю и подключаю сертификат Let's Encrypt для ${DOMAIN}…"
