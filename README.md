@@ -44,7 +44,7 @@ EMAIL="your@email.com"
 
 🧩 3. Запустите установку
 ```
-sudo ./install_jitsi.sh
+sudo bash install_jitsi.sh
 ```
 
 Скрипт автоматически:
